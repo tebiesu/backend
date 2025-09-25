@@ -31,20 +31,26 @@ async def chat_stream(user_id: str, chat_req: ChatRequest) -> AsyncGenerator[str
         return  # 终止生成
 
     # 第二步：获取或创建会话（MVP简化用default_session，后续可user_id生成session_id）
-    session_id = "default_session"  # MVP简化session ID，后续增强为user_id+时间戳
+    session_id = f"{user_id}_session"  # MVP简化session ID，后续增强为user_id+时间戳
     session = await get_session(session_id)  # 异步查询会话
     if not session:  # 如果不存在
         await create_session({"session_id": session_id, "user_id": user_id})  # 创建新会话
 
     # 第三步：构建对话历史，从DB获取session消息
     history = await get_messages(session_id)  # 异步获取消息列表
-    content_parts = []  # 构建内容部分列表，[]是JSON数组
-    for msg in history:  # 先添加历史
-        if "role" in msg and "content" in msg:
-            # Gemini内容部分格式：{"role": "user/assistant", "parts": [{"text": "内容"}]}
-            # 支持多段内容，MVP简化为单段
-            content_parts.append({"role": msg["role"], "parts": [{"text": msg["content"]}]})
-    content_parts.append({"role": "user", "parts": [{"text": chat_req.message}]})  # 最后添加用户消息
+
+    history_content = []
+    for msg in history:
+         if "role" in msg and "content" in msg:
+             role = 'user' if msg["role"] == "user" else 'model'  # Gemini 用 'model' for assistant
+             
+             part = Part(text=msg["content"])
+             content = Content(role=role, parts=[part])
+             history_content.append(content)
+     # 添加新用户消息
+    user_part = Part(text=chat_req.message)
+    user_content = Content(role='user', parts=[user_part])
+    history_content.append(user_content)
 
     # 第四步：保存用户消息到DB，支持多轮上下文
     await save_message(session_id, {"role": "user", "content": chat_req.message})  # 异步保存
@@ -52,22 +58,34 @@ async def chat_stream(user_id: str, chat_req: ChatRequest) -> AsyncGenerator[str
     # 第五步：Gemini流式生成
     model = genai.GenerativeModel('gemini-2.5-flash')  # 创建Gemini模型实例 (2.5-flash快且支持流式)
     response = model.generate_content(  # 生成内容调用
-        content_parts,  # 输入对话历史
-        stream=True,  # 启用流式，chunk-by-chunk
-        safety_settings=[  # 安全设置，阻塞中等/高风险内容
-            {"category": genai.types.HarmCategory.HARM_CATEGORY_HARASSMENT, "threshold": genai.types.HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE},
-            # 可添加更多类别如HARM_CATEGORY_HATE_SPEECH, HARM_CATEGORY_DANGEROUS_CONTENT等
-        ]
-    )
+          history_content,  # 输入 Gemini Content 历史列表
+          stream=True,  # 启用流式，chunk-by-chunk
+          safety_settings=[  # 安全设置，阻塞中等/高风险内容
+              {"category": genai.types.HarmCategory.HARM_CATEGORY_HARASSMENT, "threshold":
+  genai.types.HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE},
+              # 可添加更多类别如HARM_CATEGORY_HATE_SPEECH, HARM_CATEGORY_DANGEROUS_CONTENT等
+          ]
+      )
     assistant_parts = []  # 累积助手响应部分
     try:
-        async for chunk in response:  # 异步迭代每个chunk
-            if chunk.text:  # 如果chunk有文本
-                assistant_parts.append(chunk.text)  # 追加到列表
-                yield f"data: {{\"delta\": \"{chunk.text}\"}}\n\n"  # yield SSE delta事件：增量文本，前端拼接显示
-    except Exception as e:  # 捕获生成异常
-        yield f"data: {{\"error\": \"生成内容时出错: {str(e)}\"}}\n\n"  # yield SSE错误事件
-        return  # 终止生成
+           # genai stream 是 sync iterator，在 async 中用 for
+           for chunk in response:
+               delta_text = ''
+               if chunk and chunk.candidates and len(chunk.candidates) > 0:
+                   candidate = chunk.candidates[0]
+                   if candidate.content and len(candidate.content.parts) > 0:
+                       part = candidate.content.parts[0]
+                       if hasattr(part, 'text'):
+                           delta_text = part.text or ''
+               if delta_text:
+                   assistant_parts.append(delta_text)
+                   # 转义双引号防止JSON错误
+                   delta_escaped = delta_text.replace('"', '\\"')
+                   yield f"data: {{\"delta\": \"{delta_escaped}\"}}\n\n"
+    except Exception as e:
+           error_msg = str(e).replace('"', '\\"')
+           yield f"data: {{\"error\": \"生成内容时出错: {error_msg}\"}}\n\n"
+           return
     # 第六步：统一保存完整助手响应到DB
     if assistant_parts:  # 如果有回应
         full_response = ''.join(assistant_parts)  # 合并文本
